@@ -168,7 +168,11 @@ async def get_transcript(callback):
             channels=1,
             sample_rate=16000,
             vad_events=True,
+<<<<<<< HEAD
+            endpointing=300,
+=======
             endpointing=500,
+>>>>>>> origin/main
             smart_format=True,
         )
 
@@ -209,12 +213,17 @@ class ConversationManager:
             
             llm_response = self.llm.process(self.transcription_response)
 
+<<<<<<< HEAD
+            tts = TextToSpeech()
+            tts.speak(llm_response)
+=======
             print("/n")
 
             print("answer :", llm_response)
 
             # tts = TextToSpeech()
             # tts.speak(llm_response)
+>>>>>>> origin/main
 
             # Reset transcription_response for the next loop iteration
             self.transcription_response = ""
