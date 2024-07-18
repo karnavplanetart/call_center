@@ -2,3 +2,5 @@ deepgram_venv/
 .env
 *.json
 readme.txt
+*.json
+readme.txt
