@@ -36,7 +36,6 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 BACKEND_API_URL = os.getenv("BACKEND_API_URL")
 AWS_REGION = os.getenv("AWS_REGION")
 
-
 class LanguageModelProcessor:
     def __init__(self):
         self.llm = ChatGroq(temperature=0, model_name="llama3-70b-8192", groq_api_key=GROQ_API_KEY)
@@ -47,10 +46,25 @@ class LanguageModelProcessor:
         with open('system_prompt_check.txt', 'r') as file:
             self.system_prompt_check = file.read().strip()
 
+    def save_conversation(self, user_text, ai_text):
+        with open("conversation_history.txt", "a") as file:
+            file.write(f"User: {user_text}\nAI: {ai_text}\n")
+
+    def load_last_three_exchanges(self):
+        try:
+            with open("conversation_history.txt", "r") as file:
+                lines = file.readlines()
+                return "".join(lines[-6:])  # Last 3 exchanges, each has 2 lines (user and AI)
+        except FileNotFoundError:
+            return ""
+
     def check_done_talking(self, text):
+        previous_conversation = self.load_last_three_exchanges()
+
         prompt_check = ChatPromptTemplate.from_messages([
             SystemMessagePromptTemplate.from_template(self.system_prompt_check),
             MessagesPlaceholder(variable_name="chat_history"),
+            SystemMessagePromptTemplate.from_template(previous_conversation),
             HumanMessagePromptTemplate.from_template("{text}")
         ])
 
@@ -63,8 +77,6 @@ class LanguageModelProcessor:
         self.memory.chat_memory.add_user_message(text)  # Add user message to memory
 
         start_time = time.time()
-
-        # Get the response from the LLM for checking if done talking
         response = conversation_check.invoke({"text": text})
         end_time = time.time()
 
@@ -75,10 +87,8 @@ class LanguageModelProcessor:
         return response['text']
 
     def get_main_response(self, text, session_id):
-        # Define the API endpoint and payload
         api_url = BACKEND_API_URL
 
-        # Create a new user message
         user_message = {
             "role": "user",
             "content": text,
@@ -87,10 +97,8 @@ class LanguageModelProcessor:
             "refts": ""
         }
 
-        # Append new user message to conversation history
         self.conversation_history.append(user_message)
 
-        # Create payload with the current conversation history
         payload = {
             "messages": self.conversation_history,
             "brand": "sw",
@@ -110,12 +118,10 @@ class LanguageModelProcessor:
             "Content-Type": "application/json"
         }
 
-        # Send the POST request to the backend API
         response = requests.post(api_url, headers=headers, data=json.dumps(payload))
 
         if response.status_code == 200:
             response_data = response.json()
-            # Extract the assistant's response content
             assistant_replies = response_data.get("messages", [])
 
             full_responses = []
@@ -126,8 +132,8 @@ class LanguageModelProcessor:
                     "ts": time.strftime('%Y-%m-%d %H:%M:%S')
                 }
                 full_responses.append(assistant_message["content"])
-                # Append new assistant message to conversation history
                 self.conversation_history.append(assistant_message)
+                self.save_conversation(text, assistant_message["content"])  # Save the conversation
 
             return full_responses
         else:
@@ -148,7 +154,7 @@ def format_ssml(text):
     def replace_number_with_ssml(match):
         number = match.group(0)
         grouped_number = ' '.join([number[i:i+2] for i in range(0, len(number), 2)])
-        return f"<say-as interpret-as='digits'>{grouped_number}</say-as>"
+        return f"<say-as interpret-as='characters'>{grouped_number}</say-as>"
 
     ssml_text = email_pattern.sub(replace_email_with_ssml, text)
     ssml_text = number_pattern.sub(replace_number_with_ssml, ssml_text)
@@ -165,9 +171,9 @@ class TextToSpeech:
             response = self.polly.synthesize_speech(
                 Text=ssml_text,
                 TextType='ssml',
-                Engine="generative",
-                OutputFormat='mp3',  # Change to mp3
-                VoiceId='Ruth'  # You can choose other voices available in AWS Polly
+                Engine="neural",
+                OutputFormat='mp3',
+                VoiceId='Joanna'
             )
 
             if 'AudioStream' in response:
@@ -176,7 +182,6 @@ class TextToSpeech:
                     file.write(audio_stream.read())
                     audio_stream.close()
 
-                # Play the audio using a system command
                 os.system('ffplay -autoexit -nodisp speech.mp3')
 
         except Exception as e:
@@ -252,6 +257,7 @@ class ConversationManager:
         self.llm = LanguageModelProcessor()
         self.customer_query = ""
         self.silence_start_time = None
+        self.pending_transcription = ""  # Buffer for pending transcriptions
 
     def play_greeting(self):
         # Play the pre-recorded greeting message
@@ -265,6 +271,7 @@ class ConversationManager:
     async def main(self):
         def handle_full_sentence(full_sentence):
             self.transcription_response = full_sentence
+            self.pending_transcription += " " + full_sentence  # Append new input to pending transcription
 
         session_id = "sw-1-8f7cf768-9802-4e41-8877-bda08b738959-sti"  # Replace with actual session ID
 
@@ -274,13 +281,12 @@ class ConversationManager:
         async def check_done_talking():
             while True:
                 if self.transcription_response:
-                    done_talking_response = self.llm.check_done_talking(self.transcription_response)
+                    done_talking_response = self.llm.check_done_talking(self.pending_transcription.strip())
                     
                     if "customer done talking" in done_talking_response.lower():
-                        self.customer_query += " " + self.transcription_response
-                        print(f"Customer Query (Complete): {self.customer_query.strip()}")  # Log the complete customer query
+                        print(f"Customer Query (Complete): {self.pending_transcription.strip()}")  # Log the complete customer query
                         
-                        main_responses = self.llm.get_main_response(self.customer_query.strip(), session_id)
+                        main_responses = self.llm.get_main_response(self.pending_transcription.strip(), session_id)
                         
                         tts = TextToSpeech()
                         for response in main_responses:
@@ -288,9 +294,9 @@ class ConversationManager:
                             tts.speak(response)
                         
                         self.customer_query = ""  # Reset customer_query after getting the main response
+                        self.pending_transcription = ""  # Reset pending transcription after processing
                     else:
-                        self.customer_query += " " + self.transcription_response
-                        print(f"Customer Query (Appending): {self.customer_query.strip()}")  # Log the appended customer query
+                        print(f"Customer Query (Appending): {self.pending_transcription.strip()}")  # Log the appended customer query
 
                     self.transcription_response = ""  # Reset transcription_response
 

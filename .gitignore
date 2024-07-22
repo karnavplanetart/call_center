@@ -6,3 +6,6 @@ readme.txt
 readme.txt
 *.json
 readme.txt
+callcenter_venv
+callcenter_venv/
+*.mp3
