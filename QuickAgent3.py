@@ -74,7 +74,7 @@ class LanguageModelProcessor:
         print(f"LLM Check ({elapsed_time}ms): {response['text']}")
         return response['text']
 
-    def get_main_response(self, text, session_id):
+    def get_main_response(self, text, session_id, query_id):
         # Define the API endpoint and payload
         api_url = BACKEND_API_URL
 
@@ -103,7 +103,7 @@ class LanguageModelProcessor:
             "site_id": "sti",
             "prompt": "system_role_test_voice",
             "llm_type": "gpt-4o-2024-05-13",
-            "url_query": "w%3D440px%26h%3D580px%26user_id%3D%26brand%3Dsw%26site_id%3Dsti%26is_customer%3D0%26region%3Dus%26debug%3D0%26crm_customer_url%3Dhttps%253A%252F%252Fwww.simplytoimpress.com%252F%26start_page_name%3DSimply%2Bto%2BImpress%2B%257C%2BBirth%2BAnnouncements%252C%2BInvitations%252C%2BHoliday%2BCards%26t%3D477766%26llm_type%3Dgpt-4o-2024-05-13"
+            "url_query": "w%3D440px%26h%3D580px%26user_id%3D%26brand%3Dsw%26site_id%3Dsti%26is_customer%3Dus%26debug%3D0%26crm_customer_url%3Dhttps%253A%252F%252Fwww.simplytoimpress.com%252F%26start_page_name%3DSimply%2Bto%2BImpress%2B%257C%2BBirth%2BAnnouncements%252C%2BInvitations%252C%2BHoliday%2BCards%26t%3D477766%26llm_type%3Dgpt-4o-2024-05-13"
         }
 
         headers = {
@@ -123,15 +123,17 @@ class LanguageModelProcessor:
                 assistant_message = {
                     "role": "assistant",
                     "content": reply.get("content", ""),
-                    "ts": time.strftime('%Y-%m-%d %H:%M:%S')
+                    "ts": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "query_id": query_id  # Attach the unique identifier to the assistant message
                 }
-                full_responses.append(assistant_message["content"])
+                full_responses.append(assistant_message)
+
                 # Append new assistant message to conversation history
                 self.conversation_history.append(assistant_message)
 
             return full_responses
         else:
-            return ["There was an error processing your request. Please try again later."]
+            return [{"content": "There was an error processing your request. Please try again later.", "query_id": query_id}]
 
 def format_ssml(text):
     # Regular expression to match email addresses
@@ -166,7 +168,7 @@ class TextToSpeech:
             response = self.polly.synthesize_speech(
                 Text=ssml_text,
                 TextType='ssml',
-                Engine="neural",
+                Engine="generative",
                 OutputFormat='mp3',  # Change to mp3
                 VoiceId='Ruth'  # You can choose other voices available in AWS Polly
             )
@@ -202,12 +204,13 @@ async def get_transcript(callback):
     try:
         config = DeepgramClientOptions(options={"keepalive": "true"})
         deepgram: DeepgramClient = DeepgramClient(DEEPGRAM_API_KEY, config)
-        dg_connection = deepgram.listen.asyncwebsocket.v("1")
+
+        dg_connection = deepgram.listen.asynclive.v("1")
         print("Listening...")
 
-        async def on_message(result, **kwargs):
+        async def on_message(self, result, **kwargs):
             sentence = result.channel.alternatives[0].transcript
-
+            
             if not result.speech_final:
                 transcript_collector.add_part(sentence)
             else:
@@ -252,10 +255,8 @@ class ConversationManager:
         self.llm = LanguageModelProcessor()
         self.customer_query = ""
         self.silence_start_time = None
-        self.pending_transcription = ""  # Buffer for pending transcriptions
-        self.response_pending = False  # Flag to track if a response from GPT-4 is pending
-        self.query_counter = 0  # Initialize query counter
-        self.current_query_number = 0  # Track the current active query number
+        self.query_counter = 1  # Initialize the query counter
+        self.processing_response = False  # Flag to indicate if a response is being processed
 
     def play_greeting(self):
         # Play the pre-recorded greeting message
@@ -266,34 +267,9 @@ class ConversationManager:
         else:
             print("Greeting file not found")
 
-    def send_query(self, text, session_id):
-        self.query_counter += 1  # Increment query counter
-        self.current_query_number = self.query_counter  # Set current query number
-        self.response_pending = True  # Mark that we are waiting for a response
-        main_responses = self.llm.get_main_response(text, session_id)
-        return main_responses
-
-    def handle_customer_interruption(self, new_text):
-        if self.response_pending:
-            self.response_pending = False  # Mark the current response as outdated
-        self.pending_transcription += " " + new_text  # Append new input
-
-    def process_response(self, responses, query_number):
-        if query_number == self.current_query_number:
-            # Only process if the response matches the latest query
-            tts = TextToSpeech()
-            for response in responses:
-                print(f"LLM Response: {response}")  # Print each LLM response
-                tts.speak(response)
-            self.response_pending = False  # Mark response as processed
-        else:
-            # Discard the outdated response
-            print(f"Discarded response for query {query_number}")
-
     async def main(self):
         def handle_full_sentence(full_sentence):
             self.transcription_response = full_sentence
-            self.handle_customer_interruption(full_sentence)  # Handle new input
 
         session_id = "sw-1-8f7cf768-9802-4e41-8877-bda08b738959-sti"  # Replace with actual session ID
 
@@ -303,22 +279,38 @@ class ConversationManager:
         async def check_done_talking():
             while True:
                 if self.transcription_response:
-                    done_talking_response = self.llm.check_done_talking(self.pending_transcription.strip())
-                    
-                    if "customer done talking" in done_talking_response.lower():
-                        print(f"Customer Query (Complete): {self.pending_transcription.strip()}")  # Log the complete customer query
-                        
-                        self.response_pending = True  # Indicate that a response from GPT-4 is pending
-                        main_responses = self.send_query(self.pending_transcription.strip(), session_id)
-                        
-                        self.process_response(main_responses, self.current_query_number)
-                        
-                        self.customer_query = ""  # Reset customer_query after getting the main response
-                        self.pending_transcription = ""  # Reset pending transcription after processing
-                    else:
-                        print(f"Customer Query (Appending): {self.pending_transcription.strip()}")  # Log the appended customer query
+                    done_talking_response = self.llm.check_done_talking(self.transcription_response)
 
-                    self.transcription_response = ""  # Reset transcription_response
+                    if "customer done talking" in done_talking_response.lower():
+                        self.customer_query += " " + self.transcription_response
+                        self.transcription_response = ""  # Reset transcription_response before processing
+                        print(f"Customer Query (Complete): {self.customer_query.strip()}")  # Log the complete customer query
+                        
+                        # Generate a unique identifier for the query
+                        query_id = self.query_counter
+                        self.query_counter += 1  # Increment the counter for the next query
+                        print(f"Query ID: {query_id}")  # Print the unique identifier
+                        
+                        self.processing_response = True  # Set the processing flag
+                        main_responses = self.llm.get_main_response(self.customer_query.strip(), session_id, query_id)
+                        
+                        tts = TextToSpeech()
+                        for response in main_responses:
+                            # Check if there is a new transcription response
+                            if self.transcription_response:
+                                print("Customer interrupted, discarding current response.")
+                                self.processing_response = False  # Reset the processing flag
+                                break  # Discard the current response
+                            
+                            print(f"LLM Response (Query ID {response['query_id']}): {response['content']}")  # Print each LLM response
+                            tts.speak(response['content'])
+
+                        self.processing_response = False  # Reset the processing flag after finishing
+                        self.customer_query = ""  # Reset customer_query after getting the main response
+                    else:
+                        self.customer_query += " " + self.transcription_response
+                        print(f"Customer Query (Appending): {self.customer_query.strip()}")  # Log the appended customer query
+                        self.transcription_response = ""  # Reset transcription_response after appending
 
                 await asyncio.sleep(1)  # Check every second
 
