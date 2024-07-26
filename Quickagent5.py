@@ -1,0 +1,360 @@
+import asyncio
+from dotenv import load_dotenv
+import shutil
+import subprocess
+import requests
+import time
+import os
+import json
+import re
+import boto3
+import sounddevice as sd
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import (
+    ChatPromptTemplate,
+    MessagesPlaceholder,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate,
+)
+from langchain.chains import LLMChain
+
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
+
+# Load environment variables from .env file
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+BACKEND_API_URL = os.getenv("BACKEND_API_URL")
+AWS_REGION = os.getenv("AWS_REGION")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+transcribe_client = TranscribeStreamingClient(region=AWS_REGION)
+
+class LanguageModelProcessor:
+    def __init__(self):
+        self.llm = ChatGroq(temperature=0, model_name="llama3-70b-8192", groq_api_key=GROQ_API_KEY)
+        self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        self.conversation_history = []
+
+        # Load the system prompts from files
+        with open('system_prompt_check.txt', 'r') as file:
+            self.system_prompt_check = file.read().strip()
+
+    def check_done_talking(self, text):
+        prompt_check = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(self.system_prompt_check),
+            MessagesPlaceholder(variable_name="chat_history"),
+            HumanMessagePromptTemplate.from_template("{text}")
+        ])
+
+        conversation_check = LLMChain(
+            llm=self.llm,
+            prompt=prompt_check,
+            memory=self.memory
+        )
+
+        self.memory.chat_memory.add_user_message(text)  # Add user message to memory
+
+        start_time = time.time()
+
+        # Get the response from the LLM for checking if done talking
+        response = conversation_check.invoke({"text": text})
+        end_time = time.time()
+
+        self.memory.chat_memory.add_ai_message(response['text'])  # Add AI response to memory
+
+        elapsed_time = int((end_time - start_time) * 1000)
+        print(f"LLM Check ({elapsed_time}ms): {response['text']}")
+        return response['text']
+
+    async def get_main_response(self, text, session_id, query_id, interrupt_flag):
+        # Define the API endpoint and payload
+        api_url = BACKEND_API_URL
+
+        # Create a new user message
+        user_message = {
+            "role": "user",
+            "content": text,
+            "ts": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "original_list": [],
+            "refts": ""
+        }
+
+        # Append new user message to conversation history
+        self.conversation_history.append(user_message)
+
+        # Create payload with the current conversation history
+        payload = {
+            "messages": self.conversation_history,
+            "brand": "sw",
+            "user_id": "",
+            "session_id": session_id,
+            "debug": "0",
+            "token": "",
+            "is_customer": 0,
+            "hash": "e0a507831719956753",
+            "site_id": "sti",
+            "prompt": "system_role_test_voice",
+            "llm_type": "gpt-4o-2024-05-13",
+            "url_query": "w%3D440px%26h%3D580px%26user_id%3D%26brand%3Dsw%26site_id%3Dsti%26is_customer%3Dus%26debug%3D0%26crm_customer_url%3Dhttps%253A%252F%252Fwww.simplytoimpress.com%252F%26start_page_name%3DSimply%2Bto%2BImpress%2B%257C%2BBirth%2BAnnouncements%252C%2BInvitations%252C%2BHoliday%2BCards%26t%3D477766%26llm_type%3Dgpt-4o-2024-05-13"
+        }
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        try:
+            # Send the POST request to the backend API
+            response = await asyncio.to_thread(requests.post, api_url, headers=headers, data=json.dumps(payload))
+
+            if response.status_code == 200:
+                response_data = response.json()
+                # Extract the assistant's response content
+                assistant_replies = response_data.get("messages", [])
+
+                full_responses = []
+                for reply in assistant_replies:
+                    # Check if interrupted
+                    if interrupt_flag.is_set():
+                        print("Processing interrupted by customer")
+                        return []
+
+                    assistant_message = {
+                        "role": "assistant",
+                        "content": reply.get("content", ""),
+                        "ts": time.strftime('%Y-%m-%d %H:%M:%S'),
+                        "query_id": query_id  # Attach the unique identifier to the assistant message
+                    }
+                    full_responses.append(assistant_message)
+
+                    # Append new assistant message to conversation history
+                    self.conversation_history.append(assistant_message)
+
+                return full_responses
+            else:
+                return [{"content": "There was an error processing your request. Please try again later.", "query_id": query_id}]
+        except Exception as e:
+            print(f"Error during get_main_response: {e}")
+            return [{"content": "There was an error processing your request. Please try again later.", "query_id": query_id}]
+
+class TextToSpeech:
+    def __init__(self):
+        self.polly = boto3.client('polly', region_name=AWS_REGION)
+        self.playing = False  # Flag to indicate if TTS is playing
+        self.process = None  # Store the process handle
+
+    async def speak(self, text):
+        
+        def format_ssml(text):
+            # Regular expression to match email addresses
+            email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
+            # Regular expression to match numbers with more than 4 digits
+            number_pattern = re.compile(r'\b\d{5,}\b')
+            # Function to replace email with SSML
+            def replace_email_with_ssml(match):
+                local_part = match.group(1)
+                domain_part = match.group(2)
+                return f"<say-as interpret-as='characters'>{local_part}</say-as>@{domain_part}"
+            # Function to replace number with SSML
+            def replace_number_with_ssml(match):
+                number = match.group(0)
+                grouped_number = ' '.join([number[i:i+2] for i in range(0, len(number), 2)])
+                return f"<say-as interpret-as='digits'>{grouped_number}</say-as>"
+            ssml_text = email_pattern.sub(replace_email_with_ssml, text)
+            ssml_text = number_pattern.sub(replace_number_with_ssml, ssml_text)
+            return f"<speak>{ssml_text}</speak>"
+        
+        
+        ssml_text = format_ssml(text)
+        print(f"format_ssml : {ssml_text}")  # Debugging print statement
+        ssml_text = format_ssml(text)
+        print(f"format_ssml : {ssml_text}")  # Debugging print statement
+        try:
+            response = self.polly.synthesize_speech(
+                Text=ssml_text,
+                TextType='ssml',
+                Engine="generative",
+                OutputFormat='mp3',  # Change to mp3
+                VoiceId='Ruth'  # You can choose other voices available in AWS Polly
+            )
+
+            if 'AudioStream' in response:
+                audio_stream = response['AudioStream']
+                with open('speech.mp3', 'wb') as file:
+                    file.write(audio_stream.read())
+                    audio_stream.close()
+
+                # Play the audio using a system command
+                self.playing = True
+                print("TTS playback started")
+                self.process = await asyncio.create_subprocess_exec(
+                    'ffplay', '-autoexit', '-nodisp', 'speech.mp3',
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                await self.process.communicate()
+                self.playing = False
+                print("TTS playback stopped")
+
+        except Exception as e:
+            self.playing = False
+            print(f"Error in Polly TTS: {e}")
+
+    async def stop(self):
+        if self.playing and self.process:
+            self.process.terminate()  # Terminate the TTS playback
+            await self.process.wait()
+            self.playing = False
+            print("TTS playback stopped by interruption")
+
+class MyEventHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream, callback, manager):
+        super().__init__(output_stream)
+        self.callback = callback
+        self.manager = manager
+
+    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
+        results = transcript_event.transcript.results
+        for result in results:
+            for alt in result.alternatives:
+                if result.is_partial:
+                    if self.manager.processing_response:
+                        print("Customer interrupted during processing response")
+                    if self.manager.tts.playing:
+                        print("Customer interrupted during TTS playback")
+                print(f"Real-Time Transcript: {alt.transcript.strip()}")  # Print real-time transcriptions
+                if not result.is_partial:
+                    full_sentence = alt.transcript.strip()
+                    if full_sentence:
+                        print(f"Human: {full_sentence}")
+                        self.callback(full_sentence)
+async def get_transcript(callback, manager):
+    try:
+        stream = await transcribe_client.start_stream_transcription(
+            language_code="en-US",
+            media_sample_rate_hz=16000,
+            media_encoding="pcm",
+        )
+
+        async def send_audio():
+            def callback(indata, frames, time, status):
+                if status:
+                    print(status)
+                loop.call_soon_threadsafe(audio_queue.put_nowait, bytes(indata))
+
+            loop = asyncio.get_event_loop()
+            audio_queue = asyncio.Queue()
+
+            with sd.RawInputStream(samplerate=16000, blocksize=1024, dtype='int16',
+                                   channels=1, callback=callback):
+                while True:
+                    audio_chunk = await audio_queue.get()
+                    await stream.input_stream.send_audio_event(audio_chunk=audio_chunk)
+
+        handler = MyEventHandler(stream.output_stream, callback, manager)
+        await asyncio.gather(send_audio(), handler.handle_events())
+
+    except Exception as e:
+        print(f"Could not transcribe: {e}")
+        return
+class ConversationManager:
+    def __init__(self):
+        self.transcription_response = ""
+        self.llm = LanguageModelProcessor()
+        self.customer_query = ""
+        self.last_completed_query = ""  # Store the last completed query
+        self.silence_start_time = None
+        self.query_counter = 1  # Initialize the query counter
+        self.processing_response = False  # Flag to indicate if a response is being processed
+        self.interrupted = False  # Flag to indicate if the conversation was interrupted
+        self.session_id = "sw-1-8f7cf768-9802-4e41-8877-bda08b738959-sti"  # Replace with actual session ID
+        self.tts = TextToSpeech()  # Initialize TTS
+        self.interrupt_flag = asyncio.Event()  # Interrupt flag
+
+    def play_greeting(self):
+        # Play the pre-recorded greeting message
+        greeting_file = "greeting.mp3"  # Path to your pre-recorded greeting audio file
+        if os.path.exists(greeting_file):
+            player_command = ["ffplay", "-autoexit", "-nodisp", greeting_file]
+            subprocess.run(player_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            print("Greeting file not found")
+
+    async def process_transcriptions(self):
+        while True:
+            if self.transcription_response:
+                if self.processing_response:
+                    # If already processing a response, mark as interrupted and combine inputs
+                    self.interrupted = True
+                    self.customer_query += " " + self.transcription_response
+                    print(f"Customer Query (Interrupted and Appending): {self.customer_query.strip()}")
+                    self.transcription_response = ""  # Reset transcription_response
+                    self.interrupt_flag.set()  # Set the interrupt flag
+                    continue
+
+                done_talking_response = self.llm.check_done_talking(self.transcription_response)
+
+                if "customer done talking" in done_talking_response.lower() and not self.interrupted:
+                    self.customer_query += " " + self.transcription_response
+                    self.last_completed_query = self.customer_query.strip()
+                    self.transcription_response = ""  # Reset transcription_response before processing
+                    print(f"Customer Query (Complete): {self.customer_query.strip()}")  # Log the complete customer query
+
+                    # Generate a unique identifier for the query
+                    query_id = self.query_counter
+                    self.query_counter += 1  # Increment the counter for the next query
+                    print(f"Query ID: {query_id}")  # Print the unique identifier
+
+                    self.processing_response = True  # Set the processing flag
+                    print("Processing response started")
+                    self.interrupt_flag.clear()  # Clear the interrupt flag
+                    main_responses = await self.llm.get_main_response(self.customer_query.strip(), self.session_id, query_id, self.interrupt_flag)
+
+                    for response in main_responses:
+                        # Check if there is a new transcription response
+                        if self.transcription_response:
+                            print("Customer interrupted, discarding current response.")
+                            self.processing_response = False  # Reset the processing flag
+                            print("Processing response stopped")
+                            break  # Discard the current response
+
+                        print(f"LLM Response (Query ID {response['query_id']}): {response['content']}")  # Print each LLM response
+                        await self.tts.speak(response['content'])
+
+                    self.processing_response = False  # Reset the processing flag after finishing
+                    print("Processing response stopped")
+                    self.customer_query = ""  # Reset customer_query after getting the main response
+                else:
+                    self.customer_query += " " + self.transcription_response
+                    print(f"Customer Query (Appending): {self.customer_query.strip()}")  # Log the appended customer query
+                    self.transcription_response = ""  # Reset transcription_response after appending
+
+                self.interrupted = False  # Reset the interrupted flag
+
+            await asyncio.sleep(1)  # Check every second
+
+    async def main(self):
+        self.play_greeting()
+
+        await asyncio.gather(
+            get_transcript(self.handle_full_sentence, self),
+            self.process_transcriptions()
+        )
+
+    def handle_full_sentence(self, full_sentence):
+        self.transcription_response = full_sentence
+        if self.processing_response:
+            self.interrupt_flag.set()  # Set the interrupt flag if processing response
+        if self.tts.playing:
+            asyncio.create_task(self.tts.stop())  # Stop TTS playback if playing
+
+if __name__ == "__main__":
+    manager = ConversationManager()
+    asyncio.run(manager.main())
