@@ -1,12 +1,14 @@
 import asyncio
 from dotenv import load_dotenv
 import subprocess
+import requests
 import time
 import os
 import json
 import re
 import boto3
 import sounddevice as sd
+from colorama import init, Fore, Style
 import uuid
 import aiohttp  # Import aiohttp for asynchronous HTTP requests
 
@@ -28,8 +30,11 @@ from amazon_transcribe.model import TranscriptEvent
 # Load environment variables from .env file
 load_dotenv()
 
+# Initialize colorama
+init(autoreset=True)
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-BACKEND_API_URL = "https://ai.planetart.com/api/v1/chat/chat-stream"  # Directly set URL
+BACKEND_API_URL = "https://ai.planetart.com/api/v1/chat/chat-stream"
 AWS_REGION = os.getenv("AWS_REGION")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -48,7 +53,6 @@ class LanguageModelProcessor:
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         self.conversation_history = []
 
-        # Load the system prompts from files
         with open('system_prompt_check.txt', 'r') as file:
             self.system_prompt_check = file.read().strip()
 
@@ -93,7 +97,15 @@ class LanguageModelProcessor:
         self.memory.chat_memory.add_ai_message(response['text'])  # Add AI response to memory
 
         elapsed_time = int((end_time - start_time) * 1000)
-        print(f"LLM Check ({elapsed_time}ms): {response['text']}")
+        
+        # Color-coded output
+        if "not_done_talking" in response['text'].lower():
+            print(f"{Fore.YELLOW}LLM Check ({elapsed_time}ms): {response['text']}{Style.RESET_ALL}")
+        elif "customer_done_talking" in response['text'].lower():
+            print(f"{Fore.GREEN}LLM Check ({elapsed_time}ms): {response['text']}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}LLM Check ({elapsed_time}ms): {response['text']}{Style.RESET_ALL}")
+
         return response['text']
 
     async def get_main_response(self, text, session_id, query_id, interrupt_flag, tts):
@@ -110,14 +122,17 @@ class LanguageModelProcessor:
         self.conversation_history.append(user_message)
 
         payload = {
-            "messages": [{"role": "user", "content": "do you have any books about landing on the moon", "ts": "2024-7-16 8:23:0", "original_list": [], "refts": ""}],
-            "brand": "ism",
+            "messages": self.conversation_history,
+            "brand": "sw",
             "user_id": "",
-            "session_id": "fp-1-c5aa43cf-db5e-4748-882a-65eb012fb10e-fpus",
+            "session_id": session_id,
+            "debug": "0",
             "token": "",
             "is_customer": 0,
-            "hash": "a1b80e201721118180",
-            "site_id": "ismus",
+            "hash": "e0a507831719956753",
+            "site_id": "sti",
+            "prompt": "system_role_test_voice",
+            "llm_type": "gpt-4o-2024-05-13",
             "url_query": "is_customer%3D0%26brand%3Dfp%26site_id%3Dfpus%26llm_type%3Dclaude35-sonnet"
         }
 
@@ -128,7 +143,10 @@ class LanguageModelProcessor:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=payload, headers=headers) as response:
-                    response.raise_for_status()  # Raise an exception for HTTP errors
+                    response.raise_for_status()
+                    full_message = ""
+                    first_segment_sent = False
+
                     async for line in response.content:
                         if line:
                             current_time = time.time()
@@ -142,24 +160,50 @@ class LanguageModelProcessor:
                                     print("Processing interrupted by customer")
                                     return
 
+                                content = reply.get("content", "")
+                                full_message += content
+
+                                if not first_segment_sent and len(full_message.split()) > 20:
+                                    words = full_message.split()
+                                    first_five_words = ' '.join(words[:5])
+                                    rest_of_message = ' '.join(words[5:])
+
+                                    # Find the first period after the first five words
+                                    period_index = rest_of_message.find('.')
+                                    if period_index != -1:
+                                        first_segment = first_five_words + ' ' + rest_of_message[:period_index+1]
+                                        second_segment = rest_of_message[period_index+1:].strip()
+                                        
+                                        # Send first segment to TTS
+                                        await tts.speak(first_segment)
+                                        
+                                        # Send second segment to TTS (but don't play yet)
+                                        await tts.prepare_audio(second_segment)
+                                        
+                                        # Now play the second segment
+                                        await tts.play_prepared_audio()
+                                        
+                                        first_segment_sent = True
+                                    else:
+                                        # If no period found, speak the entire message
+                                        await tts.speak(full_message)
+                                        first_segment_sent = True
+
                                 assistant_message = {
                                     "role": "assistant",
-                                    "content": reply.get("content", ""),
+                                    "content": content,
                                     "ts": time.strftime('%Y-%m-%d %H:%M:%S'),
-                                    "query_id": query_id  # Attach the unique identifier to the assistant message
+                                    "query_id": query_id
                                 }
                                 self.conversation_history.append(assistant_message)
-                                
-                                tts_start_time = time.time()
-                                print(f"TTS playback started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(tts_start_time))} for message: {assistant_message['content']}")
-                                await tts.speak(assistant_message["content"])
-                                tts_end_time = time.time()
-                                print(f"TTS playback ended at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(tts_end_time))}")
+
+                    if not first_segment_sent:
+                        # If the message was short, just play it all at once
+                        await tts.speak(full_message)
 
         except Exception as e:
             print(f"Error during get_main_response: {e}")
             await tts.speak("There was an error processing your request. Please try again later.")
-
 
 class MyEventHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, callback, manager):
@@ -182,7 +226,6 @@ class MyEventHandler(TranscriptResultStreamHandler):
                         print("Customer interrupted during processing response")
                     if self.manager.tts.playing:
                         print("Customer interrupted during TTS playback")
-
 
 async def get_transcript(callback, manager):
     try:
@@ -214,30 +257,85 @@ async def get_transcript(callback, manager):
         print(f"Could not transcribe: {e}")
         return
     
-    
-
 class TextToSpeech:
     def __init__(self):
         self.polly = boto3.client('polly', region_name=AWS_REGION)
         self.playing = False  # Flag to indicate if TTS is playing
         self.process = None  # Store the process handle
+        self.prepared_audio = None
+        
+    def format_ssml(self, text):
+        # Regular expression patterns
+        email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
+        number_pattern = re.compile(r'\b\d{5,}\b')
+        url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+
+        def replace_email_with_ssml(match):
+            local_part = match.group(1)
+            domain_part = match.group(2)
+            return f"<break time='300ms'/><say-as interpret-as='characters'>{local_part}</say-as><break time='300ms'/>@{domain_part}"
+
+        def replace_number_with_ssml(match):
+            number = match.group(0)
+            grouped_number = ' '.join([number[i:i+2] for i in range(0, len(number), 2)])
+            return f"<say-as interpret-as='telephone'>{grouped_number}</say-as>"
+
+        # Remove URLs
+        text = url_pattern.sub('', text)
+
+        ssml_text = email_pattern.sub(replace_email_with_ssml, text)
+        ssml_text = number_pattern.sub(replace_number_with_ssml, ssml_text)
+        return f"<speak>{ssml_text}</speak>"
+
+    async def prepare_audio(self, text):
+        ssml_text = self.format_ssml(text)
+        response = self.polly.synthesize_speech(
+            Text=ssml_text,
+            TextType='ssml',
+            Engine="generative",
+            OutputFormat='mp3',
+            VoiceId='Ruth'
+        )
+        if 'AudioStream' in response:
+            self.prepared_audio = response['AudioStream'].read()
+
+    async def play_prepared_audio(self):
+        if self.prepared_audio:
+            with open('speech.mp3', 'wb') as file:
+                file.write(self.prepared_audio)
+            
+            self.playing = True
+            print("TTS playback started")
+            self.process = await asyncio.create_subprocess_exec(
+                'ffplay', '-autoexit', '-nodisp', 'speech.mp3',
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            await self.process.communicate()
+            self.playing = False
+            print("TTS playback stopped")
+            self.prepared_audio = None
 
     async def speak(self, text):
         def format_ssml(text):
-            # Regular expression to match email addresses
+            # Regular expression patterns
             email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
-            # Regular expression to match numbers with more than 4 digits
             number_pattern = re.compile(r'\b\d{5,}\b')
-            # Function to replace email with SSML
+            url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
+
             def replace_email_with_ssml(match):
                 local_part = match.group(1)
                 domain_part = match.group(2)
                 return f"<break time='300ms'/><say-as interpret-as='characters'>{local_part}</say-as><break time='300ms'/>@{domain_part}"
-            # Function to replace number with SSML
+
             def replace_number_with_ssml(match):
                 number = match.group(0)
                 grouped_number = ' '.join([number[i:i+2] for i in range(0, len(number), 2)])
                 return f"<say-as interpret-as='telephone'>{grouped_number}</say-as>"
+
+            # Remove URLs
+            text = url_pattern.sub('', text)
+
             ssml_text = email_pattern.sub(replace_email_with_ssml, text)
             ssml_text = number_pattern.sub(replace_number_with_ssml, ssml_text)
             return f"<speak>{ssml_text}</speak>"
@@ -330,15 +428,16 @@ class ConversationManager:
 
                 done_talking_response = self.llm.check_done_talking(self.customer_query)
 
-                if "customer still needs to talk" in done_talking_response.lower():
-                    print("Customer still needs to talk. Starting/resetting 5-second timer.")
+                if "not_done_talking" in done_talking_response.lower():
+                    print(f"{Fore.YELLOW}Customer still needs to talk. Starting/resetting 20-second timer.{Style.RESET_ALL}")
                     self.still_talking_timer = time.time()
                 else:
+                    print(f"{Fore.GREEN}Customer done talking. Processing complete query.{Style.RESET_ALL}")
                     await self.process_complete_query()
 
             # Check if the 5-second timer for "still talking" has elapsed
-            if self.still_talking_timer and (time.time() - self.still_talking_timer) > 5:
-                print("5 seconds elapsed after 'still talking'. Processing as complete query.")
+            if self.still_talking_timer and (time.time() - self.still_talking_timer) > 20:
+                print("20 seconds elapsed after 'still talking'. Processing as complete query.")
                 await self.process_complete_query()
 
             await asyncio.sleep(0.1)  # Check frequently
@@ -370,10 +469,10 @@ class ConversationManager:
                 self.tts.playing or 
                 self.processing_response or 
                 self.transcription_response or
-                (current_time - self.last_activity_time) < 2  # Short buffer for speech gaps
+                (current_time - self.last_activity_time) < 2
             )
             
-            if not is_active:
+            if not is_active and not self.tts.playing and not self.processing_response:
                 if idle_start_time is None:
                     idle_start_time = time.time()
                     print(f"Idle timeout timer started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -381,6 +480,7 @@ class ConversationManager:
                     print(f"10-second idle threshold reached at {time.strftime('%Y-%m-%d %H:%M:%S')} . Giving first warning.")
                     await self.tts.speak_timeout_message("Hey, are you still there?")
                     first_warning_given = True
+                    idle_start_time = time.time()  # Reset the timer after warning
                 elif time.time() - idle_start_time > 20:
                     print(f"20-second idle threshold reached at {time.strftime('%Y-%m-%d %H:%M:%S')}. Terminating the call.")
                     await self.tts.speak_timeout_message("Thank you for calling, I am terminating the call due to user inactivity.")

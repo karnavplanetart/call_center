@@ -1,15 +1,16 @@
 import requests
 import json
+import time
 
 send_data = {
-    "messages": [{"role": "user", "content": "where is my order ? order number: FP115259217206, email stu0512@avqtest.test", "ts": "2024-7-16 8:23:0", "original_list": [], "refts": ""}],
-    "brand": "fp",
+    "messages": [{"role": "user", "content": "do you have any books about landing on the moon", "ts": "2024-7-16 8:23:0", "original_list": [], "refts": ""}],
+    "brand": "ism",
     "user_id": "",
     "session_id": "fp-1-c5aa43cf-db5e-4748-882a-65eb012fb10e-fpus",
     "token": "",
     "is_customer": 0,
     "hash": "a1b80e201721118180",
-    "site_id": "fpus",
+    "site_id": "ismus",
     "url_query": "is_customer%3D0%26brand%3Dfp%26site_id%3Dfpus%26llm_type%3Dclaude35-sonnet"
 }
 
@@ -22,6 +23,8 @@ def stream_json_request(url):
         response.raise_for_status()  # Raise an exception for HTTP errors
         for line in response.iter_lines():
             if line:
+                current_time = time.time()
+                print(f"Received part of the response at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}")
                 json_object = json.loads(line.decode('utf-8'))
                 print(line)
 
