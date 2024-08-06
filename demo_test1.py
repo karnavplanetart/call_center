@@ -146,6 +146,7 @@ class LanguageModelProcessor:
                     response.raise_for_status()
                     full_message = ""
                     first_segment_sent = False
+                    background_music_task = None
 
                     async for line in response.content:
                         if line:
@@ -177,10 +178,13 @@ class LanguageModelProcessor:
                                         # Send first segment to TTS
                                         await tts.speak(first_segment)
                                         
+                                        # Start looping background music
+                                        background_music_task = asyncio.create_task(tts.play_background_music())
+                                        
                                         # Send second segment to TTS (but don't play yet)
                                         await tts.prepare_audio(second_segment)
                                         
-                                        # Now play the second segment
+                                        # Stop background music and play the second segment
                                         await tts.play_prepared_audio()
                                         
                                         first_segment_sent = True
@@ -263,7 +267,22 @@ class TextToSpeech:
         self.playing = False  # Flag to indicate if TTS is playing
         self.process = None  # Store the process handle
         self.prepared_audio = None
+        self.background_music_process = None
         
+    async def play_background_music(self):
+            if self.background_music_process is None:
+                self.background_music_process = await asyncio.create_subprocess_exec(
+                    'ffplay', '-nodisp', '-loop', '-1', 'rhythmic_robot_typing.mp3',
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+
+    async def stop_background_music(self):
+            if self.background_music_process:
+                self.background_music_process.terminate()
+                await self.background_music_process.wait()
+                self.background_music_process = None
+            
     def format_ssml(self, text):
         # Regular expression patterns
         email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
@@ -300,6 +319,7 @@ class TextToSpeech:
             self.prepared_audio = response['AudioStream'].read()
 
     async def play_prepared_audio(self):
+        await self.stop_background_music()  # Stop background music before playing prepared audio
         if self.prepared_audio:
             with open('speech.mp3', 'wb') as file:
                 file.write(self.prepared_audio)
@@ -317,6 +337,7 @@ class TextToSpeech:
             self.prepared_audio = None
 
     async def speak(self, text):
+        await self.stop_background_music()  # Stop background music before speaking
         def format_ssml(text):
             # Regular expression patterns
             email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
