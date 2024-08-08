@@ -9,6 +9,7 @@ import re
 import boto3
 import sounddevice as sd
 import uuid
+from colorama import init, Fore, Style
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
@@ -27,6 +28,9 @@ from amazon_transcribe.model import TranscriptEvent
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Initialize colorama
+init(autoreset=True)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 BACKEND_API_URL = os.getenv("BACKEND_API_URL")
@@ -51,7 +55,7 @@ class LanguageModelProcessor:
             self.system_prompt_check = file.read().strip()
 
     def get_combined_conversation(self, n):
-        conv_combined_text = ""
+        conv_combined_text = f"{Fore.BLUE}Combined Conversation for LLM Check:\n"
         # Get the last n messages from conversation history
         last_n_messages = self.conversation_history[-n:]
         
@@ -59,14 +63,15 @@ class LanguageModelProcessor:
             role = "User" if message["role"] == "user" else "Assistant"
             conv_combined_text += f"{role}: {message['content']}\n"
         
+        conv_combined_text += f"{Style.RESET_ALL}"
         return conv_combined_text.strip()
 
     def check_done_talking(self, text, n=5):
         combined_conversation = self.get_combined_conversation(n)
-        combined_conversation += f"\nUser: {text}"  # Add the current user message
+        combined_conversation += f"{Fore.BLUE}\nUser: {text}{Style.RESET_ALL}"  # Add the current user message
 
         # Print the combined conversation text for clarity
-        print(f"Combined Conversation for LLM Check:\n{combined_conversation}\n")
+        print(combined_conversation)
 
         prompt_check = ChatPromptTemplate.from_messages([
             SystemMessagePromptTemplate.from_template(self.system_prompt_check),
@@ -91,7 +96,12 @@ class LanguageModelProcessor:
         self.memory.chat_memory.add_ai_message(response['text'])  # Add AI response to memory
 
         elapsed_time = int((end_time - start_time) * 1000)
-        print(f"LLM Check ({elapsed_time}ms): {response['text']}")
+        if "not_done_talking" in response['text'].lower():
+            print(f"{Fore.YELLOW}LLM Check ({elapsed_time}ms): {response['text']}{Style.RESET_ALL}")
+        elif "customer_done_talking" in response['text'].lower():
+            print(f"{Fore.GREEN}LLM Check ({elapsed_time}ms): {response['text']}{Style.RESET_ALL}")
+        else:
+            print(f"LLM Check ({elapsed_time}ms): {response['text']}")
         return response['text']
 
     async def get_main_response(self, text, session_id, query_id, interrupt_flag):
@@ -262,8 +272,8 @@ class MyEventHandler(TranscriptResultStreamHandler):
             for alt in result.alternatives:
                 transcript = alt.transcript.strip()
                 if result.is_partial:
-                    #print(f"Partial Transcript: {transcript}")
-                    # Interrupt as soon as partial result is detected
+                    print(f"Partial Transcript: {transcript}")
+                    #Interrupt as soon as partial result is detected
                     await self.manager.handle_interruption(transcript)
                 else:
                     #print(f"Final Transcript: {transcript}")
@@ -316,6 +326,11 @@ class ConversationManager:
         self.last_activity_time = time.time()
         self.speech_in_progress = False
         self.still_talking_timer = None
+        self.ignore_list = [
+            "uh-huh", "ok", "got it", "sure", "i see", "makes sense", "yeah",
+            "mhm", "uh", "oh", "hm", "right", "yep", "yup", "yes", "alright"
+        ]
+        self.partial_transcript = ""
 
     def play_greeting(self):
         greeting_file = "greeting.mp3"
@@ -325,39 +340,67 @@ class ConversationManager:
         else:
             print("Greeting file not found")
 
-    async def handle_interruption(self, partial_transcript):
+    async def handle_interruption(self, transcript, is_final=False):
         self.last_activity_time = time.time()
-        if self.processing_response or self.tts.playing:
-            print(f"Interruption detected: {partial_transcript}")
+        if self.tts.playing or self.processing_response:
+            cleaned_transcript = re.sub(r'[^\w\s]', '', transcript.lower())
+            
+            if cleaned_transcript in self.ignore_list:
+                print(f"{'Final' if is_final else 'Partial'} Transcript (Ignored): {transcript}")
+                return
+            
+            print(f"{Fore.RED}Interruption detected: {transcript}{Style.RESET_ALL}")
             self.interrupted = True
             self.interrupt_flag.set()
             await self.tts.stop()
             self.processing_response = False
-            self.interruption_text = partial_transcript
-            print(f"Interruption text: {self.interruption_text}")
+            self.interruption_text = transcript
+            print(f"{Fore.RED}Interruption text: {self.interruption_text}{Style.RESET_ALL}")
             await self.tts.play_audio_cue("interrupt_hold")
+        else:
+            # Not during playback or processing, treat as normal speech
+            if is_final:
+                self.transcription_response = transcript
+                print(f"Final Transcript: {transcript}")
+            else:
+                self.partial_transcript = transcript
+                print(f"Partial Transcript: {transcript}")
 
     async def process_transcriptions(self):
         while True:
-            if self.transcription_response:
+            new_transcription = self.transcription_response or self.partial_transcript
+            
+            if new_transcription:
                 self.last_activity_time = time.time()
-                self.customer_query += " " + self.transcription_response
-                self.transcription_response = ""
-                print(f"Current Customer Query: {self.customer_query.strip()}")
+                
+                # Only reset the still_talking_timer if it's already set and we have new transcription
+                if self.still_talking_timer is not None:
+                    print(f"Resetting 4-second timer due to new transcription at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    self.still_talking_timer = time.time()  # Reset the timer instead of setting to None
 
-                done_talking_response = self.llm.check_done_talking(self.customer_query)
+                if self.transcription_response:
+                    self.customer_query = self.transcription_response
+                    print(f"Current Customer Query: {self.customer_query.strip()}")
 
-                if "not_done_talking" in done_talking_response.lower():
-                    print("Customer still needs to talk. Starting/resetting 4-second timer.")
-                    self.still_talking_timer = time.time()
-                else:
-                    await self.tts.play_audio_cue("user_done_talking")
-                    await self.process_complete_query()
+                    done_talking_response = self.llm.check_done_talking(self.customer_query)
+
+                    if "not_done_talking" in done_talking_response.lower():
+                        if self.still_talking_timer is None:  # Only start the timer if it's not already running
+                            print(f"Customer still needs to talk. Starting 4-second timer at {time.strftime('%Y-%m-%d %H:%M:%S')}.")
+                            self.still_talking_timer = time.time()
+                    else:
+                        await self.tts.play_audio_cue("user_done_talking")
+                        await self.process_complete_query()
+
+                    self.transcription_response = ""
+                
+                self.partial_transcript = ""  # Clear partial transcript after processing
 
             if self.still_talking_timer and (time.time() - self.still_talking_timer) > 4:
-                print("4 seconds elapsed after 'still talking'. Processing as complete query.")
+                print(f"4 seconds elapsed after 'still talking' at {time.strftime('%Y-%m-%d %H:%M:%S')}. Processing as complete query.")
                 await self.tts.play_audio_cue("user_done_talking")
                 await self.process_complete_query()
+                self.still_talking_timer = None  # Reset the timer after processing
 
             await asyncio.sleep(0.1)
 
@@ -400,7 +443,8 @@ class ConversationManager:
                 self.tts.playing or 
                 self.processing_response or 
                 self.transcription_response or
-                (current_time - self.last_activity_time) < 2
+                (current_time - self.last_activity_time) < 2 or
+                self.still_talking_timer is not None  # Add this condition
             )
             
             if not is_active:
@@ -425,7 +469,12 @@ class ConversationManager:
             await asyncio.sleep(1)
 
     def handle_full_sentence(self, full_sentence):
-        self.transcription_response = full_sentence
+        if self.tts.playing or self.processing_response:
+            asyncio.create_task(self.handle_interruption(full_sentence, is_final=True))
+        else:
+            self.transcription_response = full_sentence
+            print(f"Final Transcript: {full_sentence}")
+        
         self.last_activity_time = time.time()
         self.speech_in_progress = True
 
