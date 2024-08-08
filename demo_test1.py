@@ -140,15 +140,44 @@ class LanguageModelProcessor:
             "Content-Type": "application/json"
         }
 
+        async def process_and_play_response(content):
+            words = content.split()
+            if len(words) <= 20:
+                await tts.prepare_audio(content)
+                await tts.play_prepared_audio()
+            else:
+                first_five_words = ' '.join(words[:5])
+                rest_of_message = ' '.join(words[5:])
+                period_index = rest_of_message.find('.')
+                
+                if period_index != -1:
+                    first_part = first_five_words + ' ' + rest_of_message[:period_index+1]
+                    second_part = rest_of_message[period_index+1:].strip()
+                else:
+                    first_part = content
+                    second_part = ""
+
+                await tts.prepare_audio(first_part)
+                await tts.play_prepared_audio()
+                
+                if second_part:
+                    await tts.play_background_music()
+                    await tts.prepare_audio(second_part)
+                    await tts.stop_background_music()
+                    await tts.play_prepared_audio()
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=payload, headers=headers) as response:
                     response.raise_for_status()
-                    full_message = ""
-                    first_segment_sent = False
-                    background_music_task = None
-
+                    message_count = 0
+                    
                     async for line in response.content:
+                        if interrupt_flag.is_set():
+                            print("Processing interrupted by customer")
+                            await tts.stop_background_music()
+                            return
+
                         if line:
                             current_time = time.time()
                             print(f"Received part of the response at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}")
@@ -157,41 +186,11 @@ class LanguageModelProcessor:
                             assistant_replies = json_object.get("messages", [])
 
                             for reply in assistant_replies:
-                                if interrupt_flag.is_set():
-                                    print("Processing interrupted by customer")
-                                    return
-
+                                message_count += 1
                                 content = reply.get("content", "")
-                                full_message += content
-
-                                if not first_segment_sent and len(full_message.split()) > 20:
-                                    words = full_message.split()
-                                    first_five_words = ' '.join(words[:5])
-                                    rest_of_message = ' '.join(words[5:])
-
-                                    # Find the first period after the first five words
-                                    period_index = rest_of_message.find('.')
-                                    if period_index != -1:
-                                        first_segment = first_five_words + ' ' + rest_of_message[:period_index+1]
-                                        second_segment = rest_of_message[period_index+1:].strip()
-                                        
-                                        # Send first segment to TTS
-                                        await tts.speak(first_segment)
-                                        
-                                        # Start looping background music
-                                        background_music_task = asyncio.create_task(tts.play_background_music())
-                                        
-                                        # Send second segment to TTS (but don't play yet)
-                                        await tts.prepare_audio(second_segment)
-                                        
-                                        # Stop background music and play the second segment
-                                        await tts.play_prepared_audio()
-                                        
-                                        first_segment_sent = True
-                                    else:
-                                        # If no period found, speak the entire message
-                                        await tts.speak(full_message)
-                                        first_segment_sent = True
+                                
+                                # Process and play the response immediately
+                                await process_and_play_response(content)
 
                                 assistant_message = {
                                     "role": "assistant",
@@ -201,13 +200,19 @@ class LanguageModelProcessor:
                                 }
                                 self.conversation_history.append(assistant_message)
 
-                    if not first_segment_sent:
-                        # If the message was short, just play it all at once
-                        await tts.speak(full_message)
+                    await tts.stop_background_music()  # Ensure background music is stopped at the end
+                    print(f"Processed {message_count} messages.")
 
         except Exception as e:
             print(f"Error during get_main_response: {e}")
+            await tts.stop_background_music()
             await tts.speak("There was an error processing your request. Please try again later.")
+
+        # Check for interruption one last time before exiting
+        if interrupt_flag.is_set():
+            print("Processing interrupted by customer at the end")
+            await tts.stop_background_music()
+
 
 class MyEventHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, callback, manager):
@@ -264,24 +269,16 @@ async def get_transcript(callback, manager):
 class TextToSpeech:
     def __init__(self):
         self.polly = boto3.client('polly', region_name=AWS_REGION)
-        self.playing = False  # Flag to indicate if TTS is playing
-        self.process = None  # Store the process handle
-        self.prepared_audio = None
+        self.playing = False
+        self.prepared_audio = []
+        self.process = None
         self.background_music_process = None
+        self.background_music_playing = False
         
-    async def play_background_music(self):
-            if self.background_music_process is None:
-                self.background_music_process = await asyncio.create_subprocess_exec(
-                    'ffplay', '-nodisp', '-loop', '-1', 'rhythmic_robot_typing.mp3',
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+        
+    def has_prepared_audio(self):
+        return len(self.prepared_audio) > 0
 
-    async def stop_background_music(self):
-            if self.background_music_process:
-                self.background_music_process.terminate()
-                await self.background_music_process.wait()
-                self.background_music_process = None
             
     def format_ssml(self, text):
         # Regular expression patterns
@@ -307,6 +304,7 @@ class TextToSpeech:
         return f"<speak>{ssml_text}</speak>"
 
     async def prepare_audio(self, text):
+        print(f"Preparing audio for: {text}")
         ssml_text = self.format_ssml(text)
         response = self.polly.synthesize_speech(
             Text=ssml_text,
@@ -316,16 +314,18 @@ class TextToSpeech:
             VoiceId='Ruth'
         )
         if 'AudioStream' in response:
-            self.prepared_audio = response['AudioStream'].read()
+            self.prepared_audio.append(response['AudioStream'].read())
+        print(f"Audio prepared. Total prepared segments: {len(self.prepared_audio)}")
 
     async def play_prepared_audio(self):
-        await self.stop_background_music()  # Stop background music before playing prepared audio
         if self.prepared_audio:
+            audio_data = self.prepared_audio.pop(0)
             with open('speech.mp3', 'wb') as file:
-                file.write(self.prepared_audio)
+                file.write(audio_data)
             
             self.playing = True
-            print("TTS playback started")
+            print(f"TTS playback started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
             self.process = await asyncio.create_subprocess_exec(
                 'ffplay', '-autoexit', '-nodisp', 'speech.mp3',
                 stdout=subprocess.DEVNULL,
@@ -333,8 +333,28 @@ class TextToSpeech:
             )
             await self.process.communicate()
             self.playing = False
-            print("TTS playback stopped")
-            self.prepared_audio = None
+            print(f"TTS playback ended at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            print("No prepared audio to play.")
+
+    async def play_background_music(self):
+        if not self.background_music_playing:
+            print(f"Background music started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.background_music_process = await asyncio.create_subprocess_exec(
+                'ffplay', '-nodisp', '-loop', '0', 'rhythmic_robot_typing.mp3',
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            self.background_music_playing = True
+
+    async def stop_background_music(self):
+        if self.background_music_playing:
+            self.background_music_process.terminate()
+            await self.background_music_process.wait()
+            self.background_music_process = None
+            self.background_music_playing = False
+            print(f"Background music stopped at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
 
     async def speak(self, text):
         await self.stop_background_music()  # Stop background music before speaking
