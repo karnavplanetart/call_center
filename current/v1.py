@@ -56,21 +56,23 @@ class LanguageModelProcessor:
 
     def get_combined_conversation(self, n):
         conv_combined_text = f"{Fore.BLUE}Combined Conversation for LLM Check:\n"
-        # Get the last n messages from conversation history
         last_n_messages = self.conversation_history[-n:]
         
         for message in last_n_messages:
             role = "User" if message["role"] == "user" else "Assistant"
             conv_combined_text += f"{role}: {message['content']}\n"
         
+        # Add the current accumulated query if it exists
+        if hasattr(self, 'customer_query') and self.customer_query:
+            conv_combined_text += f"User: {self.customer_query}\n"
+        
         conv_combined_text += f"{Style.RESET_ALL}"
         return conv_combined_text.strip()
 
     def check_done_talking(self, text, n=5):
         combined_conversation = self.get_combined_conversation(n)
-        combined_conversation += f"{Fore.BLUE}\nUser: {text}{Style.RESET_ALL}"  # Add the current user message
+        combined_conversation += f"{Fore.BLUE}\nUser: {text}{Style.RESET_ALL}"
 
-        # Print the combined conversation text for clarity
         print(combined_conversation)
 
         prompt_check = ChatPromptTemplate.from_messages([
@@ -85,15 +87,14 @@ class LanguageModelProcessor:
             memory=self.memory
         )
 
-        self.memory.chat_memory.add_user_message(text)  # Add user message to memory
+        self.memory.chat_memory.add_user_message(text)
 
         start_time = time.time()
 
-        # Get the response from the LLM for checking if done talking
         response = conversation_check.invoke({"text": combined_conversation})
         end_time = time.time()
 
-        self.memory.chat_memory.add_ai_message(response['text'])  # Add AI response to memory
+        self.memory.chat_memory.add_ai_message(response['text'])
 
         elapsed_time = int((end_time - start_time) * 1000)
         if "not_done_talking" in response['text'].lower():
@@ -105,10 +106,8 @@ class LanguageModelProcessor:
         return response['text']
 
     async def get_main_response(self, text, session_id, query_id, interrupt_flag):
-        # Define the API endpoint and payload
         api_url = BACKEND_API_URL
 
-        # Create a new user message
         user_message = {
             "role": "user",
             "content": text,
@@ -117,10 +116,8 @@ class LanguageModelProcessor:
             "refts": ""
         }
 
-        # Append new user message to conversation history
         self.conversation_history.append(user_message)
 
-        # Create payload with the current conversation history
         payload = {
             "messages": self.conversation_history,
             "brand": "sw",
@@ -141,17 +138,14 @@ class LanguageModelProcessor:
         }
 
         try:
-            # Send the POST request to the backend API
             response = await asyncio.to_thread(requests.post, api_url, headers=headers, data=json.dumps(payload))
 
             if response.status_code == 200:
                 response_data = response.json()
-                # Extract the assistant's response content
                 assistant_replies = response_data.get("messages", [])
 
                 full_responses = []
                 for reply in assistant_replies:
-                    # Check if interrupted
                     if interrupt_flag.is_set():
                         print("Processing interrupted by customer")
                         return []
@@ -160,11 +154,10 @@ class LanguageModelProcessor:
                         "role": "assistant",
                         "content": reply.get("content", ""),
                         "ts": time.strftime('%Y-%m-%d %H:%M:%S'),
-                        "query_id": query_id  # Attach the unique identifier to the assistant message
+                        "query_id": query_id
                     }
                     full_responses.append(assistant_message)
 
-                    # Append new assistant message to conversation history
                     self.conversation_history.append(assistant_message)
 
                 return full_responses
@@ -182,16 +175,12 @@ class TextToSpeech:
 
     async def speak(self, text):
         def format_ssml(text):
-            # Regular expression to match email addresses
             email_pattern = re.compile(r'\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b')
-            # Regular expression to match numbers with more than 4 digits
             number_pattern = re.compile(r'\b\d{5,}\b')
-            # Function to replace email with SSML
             def replace_email_with_ssml(match):
                 local_part = match.group(1)
                 domain_part = match.group(2)
                 return f"<break time='300ms'/><say-as interpret-as='characters'>{local_part}</say-as><break time='300ms'/>@{domain_part}"
-            # Function to replace number with SSML
             def replace_number_with_ssml(match):
                 number = match.group(0)
                 grouped_number = ' '.join([number[i:i+2] for i in range(0, len(number), 2)])
@@ -201,14 +190,14 @@ class TextToSpeech:
             return f"<speak>{ssml_text}</speak>"
         
         ssml_text = format_ssml(text)
-        print(f"format_ssml : {ssml_text}")  # Debugging print statement
+        print(f"format_ssml : {ssml_text}")
         try:
             response = self.polly.synthesize_speech(
                 Text=ssml_text,
                 TextType='ssml',
                 Engine="generative",
-                OutputFormat='mp3',  # Change to mp3
-                VoiceId='Ruth'  # You can choose other voices available in AWS Polly
+                OutputFormat='mp3',
+                VoiceId='Ruth'
             )
 
             if 'AudioStream' in response:
@@ -217,7 +206,6 @@ class TextToSpeech:
                     file.write(audio_stream.read())
                     audio_stream.close()
 
-                # Play the audio using a system command
                 self.playing = True
                 print("TTS playback started")
                 self.process = await asyncio.create_subprocess_exec(
@@ -273,10 +261,8 @@ class MyEventHandler(TranscriptResultStreamHandler):
                 transcript = alt.transcript.strip()
                 if result.is_partial:
                     print(f"Partial Transcript: {transcript}")
-                    #Interrupt as soon as partial result is detected
                     await self.manager.handle_interruption(transcript)
                 else:
-                    #print(f"Final Transcript: {transcript}")
                     if transcript:
                         self.callback(transcript)
 
@@ -333,7 +319,7 @@ class ConversationManager:
         self.partial_transcript = ""
 
     def play_greeting(self):
-        greeting_file = "greeting.mp3"
+        greeting_file = "demogreeting.mp3"
         if os.path.exists(greeting_file):
             player_command = ["ffplay", "-autoexit", "-nodisp", greeting_file]
             subprocess.run(player_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -357,8 +343,15 @@ class ConversationManager:
             self.interruption_text = transcript
             print(f"{Fore.RED}Interruption text: {self.interruption_text}{Style.RESET_ALL}")
             await self.tts.play_audio_cue("interrupt_hold")
+
+            # Automatically consider interruption as "not_done_talking"
+            self.customer_query += " " + self.interruption_text.strip()
+            self.customer_query = self.customer_query.strip()
+            print(f"Current Customer Query (Interruption): {self.customer_query}")
+            print("customer not done talking due to interruption")
+            # Reset the still_talking_timer to give more time for the user to continue
+            self.still_talking_timer = time.time()
         else:
-            # Not during playback or processing, treat as normal speech
             if is_final:
                 self.transcription_response = transcript
                 print(f"Final Transcript: {transcript}")
@@ -373,34 +366,40 @@ class ConversationManager:
             if new_transcription:
                 self.last_activity_time = time.time()
                 
-                # Only reset the still_talking_timer if it's already set and we have new transcription
                 if self.still_talking_timer is not None:
                     print(f"Resetting 4-second timer due to new transcription at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                    self.still_talking_timer = time.time()  # Reset the timer instead of setting to None
+                    self.still_talking_timer = time.time()
 
                 if self.transcription_response:
-                    self.customer_query = self.transcription_response
-                    print(f"Current Customer Query: {self.customer_query.strip()}")
+                    self.customer_query += " " + self.transcription_response.strip()
+                    self.customer_query = self.customer_query.strip()
+                    print(f"Current Customer Query: {self.customer_query}")
 
-                    done_talking_response = self.llm.check_done_talking(self.customer_query)
+                    if not self.interrupted:
+                        done_talking_response = self.llm.check_done_talking(self.customer_query)
 
-                    if "not_done_talking" in done_talking_response.lower():
-                        if self.still_talking_timer is None:  # Only start the timer if it's not already running
-                            print(f"Customer still needs to talk. Starting 4-second timer at {time.strftime('%Y-%m-%d %H:%M:%S')}.")
-                            self.still_talking_timer = time.time()
+                        if "not_done_talking" in done_talking_response.lower():
+                            if self.still_talking_timer is None:
+                                print(f"Customer still needs to talk. Starting 4-second timer at {time.strftime('%Y-%m-%d %H:%M:%S')}.")
+                                self.still_talking_timer = time.time()
+                        else:
+                            await self.tts.play_audio_cue("user_done_talking")
+                            await self.process_complete_query()
+                            self.customer_query = ""  # Reset the query after processing
                     else:
-                        await self.tts.play_audio_cue("user_done_talking")
-                        await self.process_complete_query()
+                        # Reset the interrupted flag
+                        self.interrupted = False
 
                     self.transcription_response = ""
                 
-                self.partial_transcript = ""  # Clear partial transcript after processing
+                self.partial_transcript = ""
 
             if self.still_talking_timer and (time.time() - self.still_talking_timer) > 4:
                 print(f"4 seconds elapsed after 'still talking' at {time.strftime('%Y-%m-%d %H:%M:%S')}. Processing as complete query.")
                 await self.tts.play_audio_cue("user_done_talking")
                 await self.process_complete_query()
-                self.still_talking_timer = None  # Reset the timer after processing
+                self.still_talking_timer = None
+                self.customer_query = ""  # Reset the query after processing
 
             await asyncio.sleep(0.1)
 
@@ -444,7 +443,7 @@ class ConversationManager:
                 self.processing_response or 
                 self.transcription_response or
                 (current_time - self.last_activity_time) < 2 or
-                self.still_talking_timer is not None  # Add this condition
+                self.still_talking_timer is not None
             )
             
             if not is_active:
